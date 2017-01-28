@@ -8,17 +8,20 @@ from traceback import print_exc
 import simpleeval, operator, ast
 from simpleeval import simple_eval
 
-__addon__        = xbmcaddon.Addon()
-__addonid__      = __addon__.getAddonInfo('id').decode( 'utf-8' )
-__xbmcversion__  = xbmc.getInfoLabel( "System.BuildVersion" ).split(".")[0]
-__skinpath__     = xbmc.translatePath( "special://skin/shortcuts/" ).decode('utf-8')
+ADDON        = xbmcaddon.Addon()
+ADDONID      = ADDON.getAddonInfo('id').decode( 'utf-8' )
+SKINPATH     = xbmc.translatePath( "special://skin/shortcuts/" ).decode('utf-8')
+
+STRINGCOMPARE = "StringCompare"
+if int( xbmc.getInfoLabel( "System.BuildVersion" ).split(".")[0] ) >= 17:
+    STRINGCOMPARE = "String.IsEqual"
 
 def log(txt):
-    if __addon__.getSetting( "enable_logging" ) == "true":
+    if ADDON.getSetting( "enable_logging" ) == "true":
         try:
             if isinstance (txt,str):
                 txt = txt.decode('utf-8')
-            message = u'%s: %s' % (__addonid__, txt)
+            message = u'%s: %s' % (ADDONID, txt)
             xbmc.log(msg=message.encode('utf-8'), level=xbmc.LOGDEBUG)
         except:
             pass
@@ -26,7 +29,7 @@ def log(txt):
 class Template():
     def __init__( self ):
         # Load the skins template.xml file
-        templatepath = os.path.join( __skinpath__ , "template.xml" )
+        templatepath = os.path.join( SKINPATH , "template.xml" )
         self.otherTemplates = []
         try:
             self.tree = xmltree.parse( templatepath )
@@ -71,7 +74,7 @@ class Template():
         self.simple_eval = simpleeval.SimpleEval()
         self.simple_eval.operators[ast.In] = operator.contains
             
-    def parseItems( self, menuType, level, items, profile, profileVisibility, visibilityCondition, menuName, mainmenuID = None, buildOthers = False ):
+    def parseItems( self, menuType, level, items, profile, profileVisibility, visibilityCondition, menuName, mainmenuID = None, buildOthers = False, mainmenuitems = None ):
         # This will build an item in our includes for a menu
         if self.includes is None or self.tree is None:
             return
@@ -100,9 +103,14 @@ class Template():
             
             treeRoot = self.getInclude( self.includes, includeName, profileVisibility, profile )
             includeTree = self.getInclude( self.includes, includeName + "-%s" %( profile ), None, None )
+
+            # If we've been passed any mainmenu items, retrieve their properties
+            properties = {}
+            if mainmenuitems is not None:
+                properties = self.getProperties( template, mainmenuitems )
             
             # Now replace all <skinshortcuts> elements with correct data
-            self.replaceElements( template, visibilityCondition, profileVisibility, items )
+            self.replaceElements( template.find( "controls" ), visibilityCondition, profileVisibility, items, properties, customitems = template.findall( "items" ) )
             
             # Add the template to the includes
             for child in template.find( "controls" ):
@@ -111,6 +119,12 @@ class Template():
         # Now we want to see if any of the main menu items match a template
         if not buildOthers or len( self.otherTemplates ) == 0:
             return
+
+        # If we've been passed any mainmenu items, retrieve the id of the main menu item
+        rootID = None
+        if mainmenuitems is not None:
+            rootID = mainmenuitems.attrib.get( "id" )
+
         progressCount = 0
         numTemplates = 0
         if menuType == "mainmenu":
@@ -129,7 +143,7 @@ class Template():
                         visibilityName = element.text
                         break
                 
-                finalVisibility = "StringCompare(Container(" + mainmenuID + ").ListItem.Property(submenuVisibility)," + visibilityName + ")"
+                finalVisibility = "%s(Container(%s).ListItem.Property(submenuVisibility),%s)" %( STRINGCOMPARE, mainmenuID, visibilityName )
             else:
                 # First we need to build the visibilityCondition, based on the visibility condition
                 # passed in, and the submenuVisibility element
@@ -139,11 +153,11 @@ class Template():
                         visibilityName = element.text
                         break
                 
-                finalVisibility = "[%s + StringCompare(Container(::SUBMENUCONTAINER::).ListItem.Property(labelID),%s)]" %( visibilityCondition, visibilityName )
+                finalVisibility = "[%s + %s(Container(::SUBMENUCONTAINER::).ListItem.Property(labelID),%s)]" %( visibilityCondition, STRINGCOMPARE, visibilityName )
 
             # Now find a matching template - if one matches, it will be saved to be processed
             # at the end (when we have all visibility conditions)
-            numTemplates += self.findOther( item, profile, profileVisibility, finalVisibility, menuType )
+            numTemplates += self.findOther( item, profile, profileVisibility, visibilityCondition, finalVisibility, menuType, rootID )
             if menuType == "mainmenu":
                 self.progress.update( int( self.current + ( ( float( self.percent ) / float( len( items ) ) ) * progressCount ) ) )
         if numTemplates != 0:
@@ -355,7 +369,7 @@ class Template():
         if returnElem is None: return None            
         return self.copy_tree( returnElem )
         
-    def findOther( self, item, profile, profileVisibility, visibilityCondition, menuType ):
+    def findOther( self, item, profile, profileVisibility, simpleVisibility, visibilityCondition, menuType, rootID ):
         # Find a template matching the item we have been passed
         foundTemplateIncludes = []
         numTemplates = 0
@@ -391,7 +405,7 @@ class Template():
                 if "container" in elem.attrib:
                     finalVisibility = visibilityCondition.replace( "::SUBMENUCONTAINER::", elem.attrib.get( "container" ) )
                 else:
-                    finalVisibility = ""
+                    finalVisibility = simpleVisibility
 
             # Check whether the skinner has set the match type (whether all conditions need to match, or any)
             matchType = "all"
@@ -428,6 +442,8 @@ class Template():
                 
             # All the rules matched, so next we'll get any properties
             properties = self.getProperties( template, item )
+            if rootID is not None:
+                properties[ "auto-rootID" ] = rootID
             
             # Next up, we do any replacements - EXCEPT for visibility, which
             # we'll store for later (in case multiple items would have an
@@ -537,14 +553,17 @@ class Template():
     def getProperties( self, elem, items ):
         # Get any properties specified in an 'other' template
         properties = {}
+
+        # Start by finding all properties defined directly in the template
         searchProperties = elem.findall( "property" )
 
-        # Start by finding any global property groups
+        # Add any properties defined in a property group
         for propertyGroup in elem.findall( "propertyGroup" ):
             for searchGroup in self.tree.findall( "propertyGroup" ):
                 if propertyGroup.text.lower() == searchGroup.attrib.get( "name" ).lower():
                     searchProperties += searchGroup.findall( "property" )
 
+        # Loop through all the properties
         for property in searchProperties:
             if "name" not in property.attrib or property.attrib.get( "name" ) in properties:
                 # Name attrib required, or we've already got a property with this name
@@ -553,7 +572,8 @@ class Template():
 
             # Pull out the tag, attribute and value attribs into an array of tuples
             rules = []
-            propertyValue = ""
+            matchAny = True
+            propertyValue = None
             if "propertyValue" in property.attrib:
                 propertyValue = property.attrib.get( "propertyValue" )
             
@@ -573,6 +593,10 @@ class Template():
                 if "value" in singleMatch.attrib:
                     value = singleMatch.attrib.get( "value" ).split( "|" )
                 rules.append( ( tag, attribute, value, propertyValue ) )
+
+            matchAll = property.find( "match" )
+            if matchAll is not None and matchAll.text.lower() == "all":
+                matchAny = False
 
             # If we haven't grabbed anything to match against yet
             if len( rules ) == 0:
@@ -603,43 +627,97 @@ class Template():
                         properties[ name ] = ""
                     continue
 
-            matchedRule = False
-            for rule in rules:
-                if matchedRule:
-                    break
+            if matchAny:
+                # Match the property if any of the rules match
+                matchedRule = False
+                for rule in rules:
+                    if matchedRule:
+                        break
 
-                # Let's get looking for any items that match
-                tag = rule[ 0 ]
-                attrib = rule[ 1 ]
-                value = rule[ 2 ]
-                
-                for item in items.findall( tag ):
-                    if attrib is not None:
-                        if attrib[ 0 ] not in item.attrib:
-                            # Doesn't have the attribute we're looking for
-                            continue
-                        if attrib[ 1 ] != item.attrib.get( attrib[ 0 ] ):
-                            # The attributes value doesn't match
-                            continue
+                    # Let's get looking for any items that match
+                    tag = rule[ 0 ]
+                    attrib = rule[ 1 ]
+                    value = rule[ 2 ]
+                    
+                    for item in items.findall( tag ):
+                        if attrib is not None:
+                            if attrib[ 0 ] not in item.attrib:
+                                # Doesn't have the attribute we're looking for
+                                continue
+                            if attrib[ 1 ] != item.attrib.get( attrib[ 0 ] ):
+                                # The attributes value doesn't match
+                                continue
 
-                    if not item.text:
-                        # The item doesn't have a value to match
-                        continue
+                        if not item.text:
+                            # The item doesn't have a value to match
+                            continue
+                                
+                        if value is not None and item.text not in value:
+                            # The value doesn't match
+                            continue
                             
-                    if value is not None and item.text not in value:
-                        # The value doesn't match
-                        continue
-                        
+                        # We've matched a property :)
+                        if rule[ 3 ] is not None:
+                            properties[ name ] = rule[ 3 ]
+                        else:
+                            properties[ name ] = item.text
+                        break
+
+            else:
+                # Match the property only if all the rules match
+                matchedRule = True
+                for rule in rules:
+                    if not matchedRule:
+                        break
+
+                    # Let's get looking for any items that match
+                    tag = rule[ 0 ]
+                    attrib = rule[ 1 ]
+                    value = rule[ 2 ]
+                    
+                    for item in items.findall( tag ):
+                        log( repr( attrib ) )
+                        if attrib is not None:
+                            if attrib[ 0 ] not in item.attrib:
+                                # Doesn't have the attribute we're looking for
+                                matchedRule = False
+                                continue
+                            if attrib[ 1 ] != item.attrib.get( attrib[ 0 ] ):
+                                # The attributes value doesn't match, so we don't want to check the rule against it
+                                continue
+
+                        if not item.text:
+                            # The item doesn't have a value to match
+                            matchedRule = False
+                            continue
+                                
+                        if value is not None and item.text not in value:
+                            # The value doesn't match
+                            matchedRule = False
+                            continue
+                            
+                if matchedRule:
                     # We've matched a property :)
                     if rule[ 3 ] is not None:
                         properties[ name ] = rule[ 3 ]
                     else:
-                        properties[ name ] = item.text
-                    break
+                        # This method only supports setting the property value directly, so if it wasn't specified,
+                        # include a log error
+                        log( "Invalid template - cannot set property directly to menu item elements value when using multiple rules for single property")
         
         return properties
+
+    def combineProperties( self, elem, items, currentProperties ):
+        # Combines an existing set of properties with additional properties
+        newProperties = self.getProperties( elem, items )
+        for propertyName in newProperties:
+            if propertyName in currentProperties.keys():
+                continue
+            currentProperties[ propertyName ] = newProperties[ propertyName ]
+
+        return currentProperties  
     
-    def replaceElements( self, tree, visibilityCondition, profileVisibility, items, properties = {} ):
+    def replaceElements( self, tree, visibilityCondition, profileVisibility, items, properties = {}, customitems = None ):
         if tree is None: return
         for elem in tree:
             # <tag skinshortcuts="visible" /> -> <tag condition="[condition]" />
@@ -769,6 +847,10 @@ class Template():
                     newelement.text = visibilityCondition
                     # Insert it
                     tree.insert( index, newelement )
+                elif type == "items" and customitems is not None and elem.attrib.get( "insert" ):
+                    for elem in self.buildSubmenuCustomItems( customitems, items.findall( "item" ), elem.attrib.get( "insert" ), properties ):
+                        for child in elem:
+                            tree.insert( index, child )
                 elif type == "items":
                     # Firstly, go through and create an array of all items in reverse order, without
                     # their existing visible element, if it matches our visibilityCondition
@@ -790,9 +872,31 @@ class Template():
                         for elem in newelements:
                             # Insert them into the template
                             tree.insert( index, elem )
+
             else:
                 # Iterate through tree
-                self.replaceElements( elem, visibilityCondition, profileVisibility, items, properties )
+                self.replaceElements( elem, visibilityCondition, profileVisibility, items, properties, customitems = customitems )
+
+    def buildSubmenuCustomItems( self, template, items, insert, currentProperties ):
+        # Builds an 'items' template within a submenu template
+
+        # Find the template with the correct insert attribute
+        itemTemplate = None
+        for testTemplate in template:
+            if testTemplate.attrib.get( "insert" ) == insert:
+                itemTemplate = testTemplate
+                break
+
+        if itemTemplate is None:
+            # Couldn't find a template
+            return []
+
+        newelements = []
+        for item in items:
+            newElement = self.copy_tree( itemTemplate.find( "controls" ) )
+            self.replaceElements( newElement, None, None, [], self.combineProperties( itemTemplate, item, currentProperties.copy() ) )
+            newelements.insert( 0, newElement )
+        return newelements
             
     def _save_hash( self, filename, file ):
         if file is not None:
